@@ -3,9 +3,9 @@
 
 # Create non-root user if needed
 if ! id -u colab &>/dev/null; then
-    useradd -m colab
+    sudo useradd -m colab
     # Add to sudoers without password
-    echo "colab ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/colab
+    echo "colab ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/colab
 fi
 
 # Install udocker for the non-root user
@@ -14,8 +14,8 @@ su - colab -c "udocker install"
 
 # Copy current directory to colab user's home
 src_dir="$(pwd)"
-cp -r "$src_dir" /home/colab/
-chown -R colab:colab /home/colab/$(basename "$src_dir")
+sudo cp -r "$src_dir" /home/colab/
+sudo chown -R colab:colab /home/colab/$(basename "$src_dir")
 
 # Create working script
 cat > /home/colab/udocker_build.sh << 'EOF'
@@ -97,53 +97,60 @@ udocker create --name="$CONTAINER_NAME" "$BASE_IMAGE:$BASE_IMAGE_TAG"
 
 # Prepare installation script for the container
 INSTALL_SCRIPT=$(mktemp)
-cat > "$INSTALL_SCRIPT" << 'INNEREOF'
+cat > "$INSTALL_SCRIPT" << INNEREOF
 #!/bin/bash
 set -e
 
+# Set non-interactive frontend for apt
+export DEBIAN_FRONTEND=noninteractive
+
 # Install system dependencies
-apt-get update && apt-get install -y \
-    git \
-    curl \
-    python3-pip \
+echo "Installing system dependencies..."
+apt-get update && apt-get install -y --no-install-recommends \\
+    git \\
+    curl \\
+    python3-pip \\
     python3-dev
 
 # Create dynamo directory
 mkdir -p /opt/dynamo
 
 # Install Python dependencies based on framework
-if [[ "$FRAMEWORK" == "VLLM" ]]; then
+if [[ "\$FRAMEWORK" == "VLLM" ]]; then
     pip3 install torch transformers vllm
-elif [[ "$FRAMEWORK" == "TENSORRTLLM" ]]; then
+elif [[ "\$FRAMEWORK" == "TENSORRTLLM" ]]; then
     pip3 install torch transformers
-elif [[ "$FRAMEWORK" == "NONE" ]]; then
+elif [[ "\$FRAMEWORK" == "NONE" ]]; then
     pip3 install transformers
 fi
 
 # Install common Python dependencies
 pip3 install pydantic fastapi uvicorn
 
-echo "Installation completed for $FRAMEWORK framework"
+echo "Installation completed for \$FRAMEWORK framework"
 INNEREOF
 
 # Make script executable
 chmod +x "$INSTALL_SCRIPT"
 
-# Instead of using 'udocker cp', we'll run a container and mount the local file
-echo "Copying installation script to container..."
 # Create directory for installation script in container
 udocker run "$CONTAINER_NAME" mkdir -p /tmp
+
 # Copy the installation script contents to the container
 CONTAINER_ROOTFS=$(udocker inspect -p "$CONTAINER_NAME")
 cp "$INSTALL_SCRIPT" "${CONTAINER_ROOTFS}/tmp/install.sh"
 chmod +x "${CONTAINER_ROOTFS}/tmp/install.sh"
 
-# Set environment variable for framework
+# Set environment variable for framework and run in F3 execmode
 udocker setup --execmode=F3 "$CONTAINER_NAME"
+
+# Fix container execution mode for apt-get operations
+echo "Configuring container execution mode..."
+udocker setup --execmode=P1 "$CONTAINER_NAME"
 
 # Run the installation script
 echo "Running installation script in container..."
-udocker run --env="FRAMEWORK=$FRAMEWORK" "$CONTAINER_NAME" /bin/bash /tmp/install.sh
+udocker run --env="FRAMEWORK=$FRAMEWORK" --env="DEBIAN_FRONTEND=noninteractive" "$CONTAINER_NAME" /bin/bash /tmp/install.sh
 
 echo "==================================================="
 echo "Container '$CONTAINER_NAME' is ready!"
@@ -154,7 +161,7 @@ echo ""
 echo "To execute commands in the container:"
 echo "  udocker run $CONTAINER_NAME <command>"
 echo ""
-echo "Example: udocker run $CONTAINER_NAME python3 -c 'print(\"Hello from Dynamo!\")"
+echo "Example: udocker run $CONTAINER_NAME python3 -c 'print(\"Hello from Dynamo!\")'"
 echo "==================================================="
 EOF
 
