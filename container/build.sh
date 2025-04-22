@@ -18,16 +18,29 @@ set -e
 
 TAG=
 RUN_PREFIX=
-PLATFORM=linux/amd64
+
+# Check if running as root and fix for udocker
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Creating non-root user for udocker..."
+    # Create non-root user if it doesn't exist
+    if ! id -u udocker &>/dev/null; then
+        useradd -m udocker
+    fi
+    
+    # Define udocker command wrapper that runs as non-root user
+    UDOCKER_CMD="su - udocker -c"
+else
+    UDOCKER_CMD=""
+fi
 
 # Get short commit hash
-commit_id=$(git rev-parse --short HEAD)
+commit_id=$(git rev-parse --short HEAD 2>/dev/null) || commit_id="local"
 
 # if COMMIT_ID matches a TAG use that
 current_tag=$(git describe --tags --exact-match 2>/dev/null | sed 's/^v//') || true
 
 # Get latest TAG and add COMMIT_ID for dev
-latest_tag=$(git describe --tags --abbrev=0 "$(git rev-list --tags --max-count=1 main)" | sed 's/^v//') || true
+latest_tag=$(git describe --tags --abbrev=0 "$(git rev-list --tags --max-count=1 main 2>/dev/null)" | sed 's/^v//') || true
 if [[ -z ${latest_tag} ]]; then
     latest_tag="0.0.1"
     echo "No git release tag found, setting to unknown version: ${latest_tag}"
@@ -39,11 +52,6 @@ VERSION=v${current_tag:-$latest_tag.dev.$commit_id}
 PYTHON_PACKAGE_VERSION=${current_tag:-$latest_tag.dev+$commit_id}
 
 # Frameworks
-#
-# Each framework has a corresponding base image.  Additional
-# dependencies are specified in the /container/deps folder and
-# installed within framework specific sections of the Dockerfile.
-
 declare -A FRAMEWORKS=(["VLLM"]=1 ["TENSORRTLLM"]=2 ["NONE"]=3)
 DEFAULT_FRAMEWORK=VLLM
 
@@ -74,7 +82,7 @@ get_options() {
             ;;
         --platform)
             if [ "$2" ]; then
-                PLATFORM=$2
+                echo "Warning: Platform option is ignored in udocker"
                 shift
             else
                 missing_requirement "$1"
@@ -130,7 +138,7 @@ get_options() {
             ;;
         --tag)
             if [ "$2" ]; then
-                TAG="--tag $2"
+                TAG="$2"
                 shift
             else
                 missing_requirement "$1"
@@ -149,7 +157,7 @@ get_options() {
             ;;
         --cache-from)
             if [ "$2" ]; then
-                CACHE_FROM="--cache-from $2"
+                echo "Warning: cache-from option is ignored in udocker"
                 shift
             else
                 missing_requirement "$1"
@@ -157,7 +165,7 @@ get_options() {
             ;;
         --cache-to)
             if [ "$2" ]; then
-                CACHE_TO="--cache-to $2"
+                echo "Warning: cache-to option is ignored in udocker"
                 shift
             else
                 missing_requirement "$1"
@@ -165,7 +173,7 @@ get_options() {
             ;;
         --build-context)
             if [ "$2" ]; then
-                BUILD_CONTEXT_ARG="--build-context $2"
+                echo "Warning: build-context option is ignored in udocker"
                 shift
             else
                 missing_requirement "$1"
@@ -218,18 +226,13 @@ get_options() {
 
         BASE_VERSION=${FRAMEWORK}_BASE_VERSION
         BASE_VERSION=${!BASE_VERSION}
-
     fi
 
     if [ -z "$TAG" ]; then
-        TAG="--tag dynamo:${VERSION}-${FRAMEWORK,,}"
+        TAG="dynamo:${VERSION}-${FRAMEWORK,,}"
         if [ -n "${TARGET}" ]; then
             TAG="${TAG}-${TARGET}"
         fi
-    fi
-
-    if [ -n "$PLATFORM" ]; then
-        PLATFORM="--platform ${PLATFORM}"
     fi
 
     if [ -n "$TARGET" ]; then
@@ -238,7 +241,6 @@ get_options() {
         TARGET_STR="--target dev"
     fi
 }
-
 
 show_image_options() {
     echo ""
@@ -259,16 +261,16 @@ show_help() {
     echo "usage: build.sh"
     echo "  [--base base image]"
     echo "  [--base-image-tag base image tag]"
-    echo "  [--platform platform for docker build"
     echo "  [--framework framework one of ${!FRAMEWORKS[*]}]"
     echo "  [--tensorrtllm-pip-wheel-path path to tensorrtllm pip wheel]"
     echo "  [--build-arg additional build args to pass to docker build]"
-    echo "  [--cache-from cache location to start from]"
-    echo "  [--cache-to location where to cache the build output]"
     echo "  [--tag tag for image]"
-    echo "  [--no-cache disable docker build cache]"
-    echo "  [--dry-run print docker commands without running]"
-    echo "  [--build-context name=path to add build context]"
+    echo "  [--no-cache disable build cache]"
+    echo "  [--dry-run print commands without running]"
+    echo "  [--target specify target build stage]"
+    echo ""
+    echo "  Note: Some Docker options like --platform, --cache-from, --cache-to,"
+    echo "  and --build-context are not supported in udocker and will be ignored"
     exit 0
 }
 
@@ -281,6 +283,79 @@ error() {
     exit 1
 }
 
+# Function to prepare for udocker
+prepare_for_udocker() {
+    # Copy the project to the non-root user's home directory if running as root
+    if [ "$(id -u)" -eq 0 ] && [ -n "$UDOCKER_CMD" ]; then
+        echo "Copying project files to udocker user's home directory..."
+        local project_dir=$(dirname "$BUILD_CONTEXT")
+        local project_name=$(basename "$BUILD_CONTEXT")
+        
+        # Create project directory in udocker user's home
+        mkdir -p /home/udocker/projects
+        cp -r "$BUILD_CONTEXT" /home/udocker/projects/
+        
+        # Set permissions
+        chown -R udocker:udocker /home/udocker/projects
+        
+        # Update paths
+        BUILD_CONTEXT="/home/udocker/projects/$project_name"
+        SOURCE_DIR="$BUILD_CONTEXT/container"
+        DOCKERFILE="$SOURCE_DIR/Dockerfile"
+        
+        if [[ $FRAMEWORK == "VLLM" ]]; then
+            DOCKERFILE="$SOURCE_DIR/Dockerfile.vllm"
+        elif [[ $FRAMEWORK == "TENSORRTLLM" ]]; then
+            DOCKERFILE="$SOURCE_DIR/Dockerfile.tensorrt_llm"
+        elif [[ $FRAMEWORK == "NONE" ]]; then
+            DOCKERFILE="$SOURCE_DIR/Dockerfile.none"
+        fi
+        
+        echo "Updated build context to: $BUILD_CONTEXT"
+    fi
+    
+    # Install udocker for the non-root user if needed
+    if [ "$(id -u)" -eq 0 ] && [ -n "$UDOCKER_CMD" ]; then
+        echo "Installing udocker for non-root user..."
+        su - udocker -c "pip install udocker"
+        su - udocker -c "udocker install"
+    fi
+}
+
+# Function to run udocker commands as non-root if needed
+run_udocker() {
+    local cmd="$1"
+    
+    if [ -n "$RUN_PREFIX" ]; then
+        echo "$RUN_PREFIX $cmd"
+        return
+    fi
+    
+    if [ -n "$UDOCKER_CMD" ]; then
+        $UDOCKER_CMD "$cmd"
+    else
+        eval "$cmd"
+    fi
+}
+
+# Function to pull an image with udocker
+udocker_pull() {
+    local image="$1:$2"
+    echo "Pulling image: $image"
+    run_udocker "udocker pull $image"
+}
+
+# Function to build an image with udocker
+udocker_build() {
+    local dockerfile="$1"
+    local tag="$2"
+    local context="$3"
+    local build_args="$4"
+    
+    echo "Building image with udocker..."
+    run_udocker "cd $context && udocker build -f $dockerfile -t $tag $build_args ."
+}
+
 get_options "$@"
 
 # Update DOCKERFILE if framework is VLLM
@@ -291,6 +366,9 @@ elif [[ $FRAMEWORK == "TENSORRTLLM" ]]; then
 elif [[ $FRAMEWORK == "NONE" ]]; then
     DOCKERFILE=${SOURCE_DIR}/Dockerfile.none
 fi
+
+# Prepare environment for udocker
+prepare_for_udocker
 
 if [[ $FRAMEWORK == "VLLM" ]]; then
     NIXL_DIR="/tmp/nixl/nixl_src"
@@ -316,10 +394,19 @@ if [[ $FRAMEWORK == "VLLM" ]]; then
         echo "Please delete $NIXL_DIR and re-run the build script."
         exit 1
     fi
+    cd - || exit
 
-    BUILD_CONTEXT_ARG+=" --build-context nixl=$NIXL_DIR"
+    # Copy nixl files to the project directory
+    NIXL_TARGET_DIR="$BUILD_CONTEXT/nixl"
+    mkdir -p "$NIXL_TARGET_DIR"
+    cp -r "$NIXL_DIR"/* "$NIXL_TARGET_DIR/"
+    
+    # Set permissions if needed
+    if [ "$(id -u)" -eq 0 ] && [ -n "$UDOCKER_CMD" ]; then
+        chown -R udocker:udocker "$NIXL_TARGET_DIR"
+    fi
 
-    # Add NIXL_COMMIT as a build argument to enable caching
+    # Add NIXL_COMMIT as a build argument
     BUILD_ARGS+=" --build-arg NIXL_COMMIT=${NIXL_COMMIT} "
 fi
 
@@ -328,7 +415,6 @@ if [[ $TARGET == "local-dev" ]]; then
 fi
 
 # BUILD DEV IMAGE
-
 BUILD_ARGS+=" --build-arg BASE_IMAGE=$BASE_IMAGE --build-arg BASE_IMAGE_TAG=$BASE_IMAGE_TAG --build-arg FRAMEWORK=$FRAMEWORK --build-arg ${FRAMEWORK}_FRAMEWORK=1 --build-arg VERSION=$VERSION --build-arg PYTHON_PACKAGE_VERSION=$PYTHON_PACKAGE_VERSION"
 
 if [ -n "${GITHUB_TOKEN}" ]; then
@@ -348,41 +434,30 @@ fi
 if [ -n "${HF_TOKEN}" ]; then
     BUILD_ARGS+=" --build-arg HF_TOKEN=${HF_TOKEN} "
 fi
-if [  ! -z ${RELEASE_BUILD} ]; then
+
+if [ ! -z ${RELEASE_BUILD} ]; then
     echo "Performing a release build!"
     BUILD_ARGS+=" --build-arg RELEASE_BUILD=${RELEASE_BUILD} "
 fi
 
-LATEST_TAG="--tag dynamo:latest-${FRAMEWORK,,}"
+LATEST_TAG="dynamo:latest-${FRAMEWORK,,}"
 if [ -n "${TARGET}" ]; then
     LATEST_TAG="${LATEST_TAG}-${TARGET}"
 fi
 
 show_image_options
 
-if [ -z "$RUN_PREFIX" ]; then
-    set -x
-fi
+echo "Checking for base image: $BASE_IMAGE:$BASE_IMAGE_TAG"
+# Pull the base image
+run_udocker "udocker pull $BASE_IMAGE:$BASE_IMAGE_TAG"
 
-# Check if the TensorRT-LLM base image exists
-if [[ $FRAMEWORK == "TENSORRTLLM" ]]; then
-    if docker inspect --type=image "$BASE_IMAGE:$BASE_IMAGE_TAG" > /dev/null 2>&1; then
-        echo "Image '$BASE_IMAGE:$BASE_IMAGE_TAG' is found."
-    else
-        echo "Image '$BASE_IMAGE:$BASE_IMAGE_TAG' is not found." >&2
-        echo "Please build the TensorRT-LLM base image first. Run ./build_trtllm_base_image.sh" >&2
-        echo "or use --base-image and --base-image-tag to an existing TensorRT-LLM base image." >&2
-        echo "See https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html for more information." >&2
-        exit 1
-    fi
-fi
+echo "Building image with tag: $TAG"
+run_udocker "cd $BUILD_CONTEXT && udocker build -f $DOCKERFILE -t $TAG $BUILD_ARGS ."
 
-$RUN_PREFIX docker build -f $DOCKERFILE $TARGET_STR $PLATFORM $BUILD_ARGS $CACHE_FROM $CACHE_TO $TAG $LATEST_TAG $BUILD_CONTEXT_ARG $BUILD_CONTEXT $NO_CACHE
+echo "Tagging image as latest: $LATEST_TAG"
+run_udocker "udocker tag $TAG $LATEST_TAG"
 
-{ set +x; } 2>/dev/null
-
-if [ -z "$RUN_PREFIX" ]; then
-    set -x
-fi
-
-{ set +x; } 2>/dev/null
+echo "Build completed successfully!"
+echo "To run the image with udocker:"
+echo "  udocker create --name=dynamo_container $TAG"
+echo "  udocker run dynamo_container"
