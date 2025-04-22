@@ -129,9 +129,14 @@ INNEREOF
 # Make script executable
 chmod +x "$INSTALL_SCRIPT"
 
-# Copy the script to the container
+# Instead of using 'udocker cp', we'll run a container and mount the local file
 echo "Copying installation script to container..."
-udocker cp "$INSTALL_SCRIPT" "$CONTAINER_NAME:/tmp/install.sh"
+# Create directory for installation script in container
+udocker run "$CONTAINER_NAME" mkdir -p /tmp
+# Copy the installation script contents to the container
+CONTAINER_ROOTFS=$(udocker inspect -p "$CONTAINER_NAME")
+cp "$INSTALL_SCRIPT" "${CONTAINER_ROOTFS}/tmp/install.sh"
+chmod +x "${CONTAINER_ROOTFS}/tmp/install.sh"
 
 # Set environment variable for framework
 udocker setup --execmode=F3 "$CONTAINER_NAME"
